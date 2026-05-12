@@ -1018,7 +1018,7 @@ fn default_toggle_columns() -> Keybind {
     Keybind::with_modifiers("c", vec!["Shift".to_string()])
 }
 fn default_new_remote_agent() -> Keybind {
-    Keybind::with_modifiers("n", vec!["Shift".to_string()])
+    Keybind::with_modifiers("r", vec!["Shift".to_string()])
 }
 
 impl Default for Keybinds {
