@@ -262,7 +262,7 @@ All keybinds are customizable in `~/.grove/config.toml`. Defaults:
 | Key | Action |
 |-----|--------|
 | `n` | Create new agent |
-| `Shift+r` | Create new remote agent |
+| `Ctrl+n` | Create new remote agent |
 | `d` | Delete selected agent |
 | `Enter` | Attach to agent's tmux session |
 | `Shift+n` | Set/edit custom note |
