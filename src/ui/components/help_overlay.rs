@@ -61,6 +61,10 @@ impl<'a> HelpOverlay<'a> {
                 kb.new_agent.display_short()
             )),
             Line::from(format!(
+                "  {:8} Create new remote agent",
+                kb.new_remote_agent.display_short()
+            )),
+            Line::from(format!(
                 "  {:8} Delete selected agent",
                 kb.delete_agent.display_short()
             )),

@@ -255,6 +255,66 @@ fn default_editor() -> String {
     "code {path}".to_string()
 }
 
+fn default_ssh_port() -> u16 {
+    22
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteHost {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_ssh_user")]
+    pub user: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub identity_file: Option<String>,
+    #[serde(default = "default_worktree_base")]
+    pub worktree_base: String,
+}
+
+fn default_ssh_user() -> String {
+    whoami::username()
+}
+
+fn default_worktree_base() -> String {
+    "~/grove-worktrees".to_string()
+}
+
+impl Default for RemoteHost {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            host: "localhost".to_string(),
+            user: default_ssh_user(),
+            port: default_ssh_port(),
+            identity_file: None,
+            worktree_base: default_worktree_base(),
+        }
+    }
+}
+
+impl RemoteHost {
+    pub fn worktree_path(&self, worktree_id: &str) -> String {
+        format!("{}/{}", self.worktree_base, worktree_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SshConfig {
+    #[serde(default)]
+    pub hosts: Vec<RemoteHost>,
+}
+
+impl SshConfig {
+    pub fn get_host(&self, name: &str) -> Option<&RemoteHost> {
+        self.hosts.iter().find(|h| h.name == name)
+    }
+
+    pub fn host_names(&self) -> Vec<&str> {
+        self.hosts.iter().map(|h| h.name.as_str()).collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GlobalConfig {
     #[serde(default)]
@@ -267,6 +327,8 @@ pub struct GlobalConfig {
     pub editor: String,
     #[serde(default)]
     pub debug_mode: bool,
+    #[serde(default)]
+    pub ssh: SshConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -855,6 +917,8 @@ pub struct Keybinds {
     pub toggle_task_filter: Keybind,
     #[serde(default = "default_toggle_columns")]
     pub toggle_columns: Keybind,
+    #[serde(default = "default_new_remote_agent")]
+    pub new_remote_agent: Keybind,
 }
 
 fn default_nav_down() -> Keybind {
@@ -953,6 +1017,9 @@ fn default_toggle_task_filter() -> Keybind {
 fn default_toggle_columns() -> Keybind {
     Keybind::with_modifiers("c", vec!["Shift".to_string()])
 }
+fn default_new_remote_agent() -> Keybind {
+    Keybind::with_modifiers("n", vec!["Shift".to_string()])
+}
 
 impl Default for Keybinds {
     fn default() -> Self {
@@ -988,6 +1055,7 @@ impl Default for Keybinds {
             debug_status: default_debug_status(),
             toggle_task_filter: default_toggle_task_filter(),
             toggle_columns: default_toggle_columns(),
+            new_remote_agent: default_new_remote_agent(),
         }
     }
 }
@@ -1000,6 +1068,7 @@ impl Keybinds {
             ("nav_first", &self.nav_first),
             ("nav_last", &self.nav_last),
             ("new_agent", &self.new_agent),
+            ("new_remote_agent", &self.new_remote_agent),
             ("delete_agent", &self.delete_agent),
             ("attach", &self.attach),
             ("set_note", &self.set_note),
@@ -1204,6 +1273,13 @@ pub struct RepoConfig {
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub automation: AutomationConfig,
+    #[serde(default)]
+    pub remote: RepoRemoteConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepoRemoteConfig {
+    pub default_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1471,6 +1547,7 @@ impl RepoConfig {
                     dev_server: DevServerConfig::default(),
                     appearance: AppearanceConfig::default(),
                     automation: AutomationConfig::default(),
+                    remote: RepoRemoteConfig::default(),
                 });
             }
 

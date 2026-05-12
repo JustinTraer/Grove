@@ -287,7 +287,13 @@ impl<'a> AgentListWidget<'a> {
             } else {
                 Style::default().fg(Color::White)
             };
-            let name = truncate_string(&agent.name, 26);
+            let display_name = if agent.is_remote() {
+                let host = agent.remote_host.as_deref().unwrap_or("remote");
+                format!("@{} {}", host, agent.name)
+            } else {
+                agent.name.clone()
+            };
+            let name = truncate_string(&display_name, 26);
             cells.push(Cell::from(name).style(name_style));
         }
 

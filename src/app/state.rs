@@ -1298,6 +1298,8 @@ pub struct AppState {
     pub show_tutorial: bool,
     pub tutorial: Option<TutorialState>,
     pub column_selector: ColumnSelectorState,
+    pub pending_remote_agent_name: Option<String>,
+    pub pending_remote_agent_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1621,6 +1623,8 @@ impl AppState {
             show_tutorial: false,
             tutorial: None,
             column_selector: ColumnSelectorState::from_config(&column_visibility),
+            pending_remote_agent_name: None,
+            pending_remote_agent_branch: None,
         }
     }
 

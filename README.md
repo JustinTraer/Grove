@@ -35,6 +35,7 @@ Grove allows you to run multiple AI coding agents simultaneously, each working o
 - **Session Persistence**: Agent sessions persist across restarts with tmux
 - **Customizable Keybinds**: All keyboard shortcuts can be personalized
 - **System Metrics**: Monitor CPU and memory usage while agents work
+- **Remote SSH Support**: Run agents on remote machines via SSH with local TUI control
 
 ## Comparison
 
@@ -47,6 +48,7 @@ Grove allows you to run multiple AI coding agents simultaneously, each working o
 | Dev server management | Yes | No | No |
 | Session persistence | Yes | Manual | No |
 | Customizable keybinds | Yes | No | No |
+| Remote SSH execution | Yes | No | No |
 
 ## Prerequisites
 
@@ -76,6 +78,12 @@ Grove allows you to run multiple AI coding agents simultaneously, each working o
 
 - GitLab, GitHub, or Codeberg account with API token
 - Asana, Notion, ClickUp, Airtable, or Linear account with API token
+
+### For Remote SSH Agents
+
+- SSH key authentication configured (`ssh-agent` or key file)
+- tmux installed on remote host
+- Git repository accessible on remote machine
 
 ## Installation
 
@@ -160,6 +168,15 @@ output_buffer_lines = 5000
 [performance]
 agent_poll_ms = 500
 git_refresh_secs = 30
+
+# SSH hosts for remote execution
+[[ssh.hosts]]
+name = "gpu-workstation"      # Reference name for this host
+host = "192.168.1.100"        # Hostname or IP
+user = "developer"            # SSH username
+port = 22                     # SSH port (default: 22)
+worktree_base = "~/grove-worktrees"  # Base path for remote worktrees
+# identity_file = "~/.ssh/id_ed25519"  # Optional: specific key file
 ```
 
 ### Project Config (`.grove/project.toml`)
@@ -176,6 +193,10 @@ main_branch = "main"
 command = "npm run dev"
 port = 3000
 auto_start = false
+
+# Default remote host for this project (optional)
+[remote]
+default_host = "gpu-workstation"
 ```
 
 **Note:** Git provider settings (owner, repo, project IDs) are auto-detected from your git remotes. You only need to configure them manually if auto-detection fails.
@@ -241,9 +262,10 @@ All keybinds are customizable in `~/.grove/config.toml`. Defaults:
 | Key | Action |
 |-----|--------|
 | `n` | Create new agent |
+| `Shift+n` | Create new remote agent |
 | `d` | Delete selected agent |
 | `Enter` | Attach to agent's tmux session |
-| `N` | Set/edit custom note |
+| `Shift+n` | Set/edit custom note |
 | `s` | Request work summary |
 | `y` | Copy agent/branch name |
 
@@ -283,6 +305,36 @@ All keybinds are customizable in `~/.grove/config.toml`. Defaults:
    - Create a git worktree for isolated work
    - Start a tmux session
    - Launch your configured AI agent
+
+### Remote SSH Execution
+
+Run agents on remote machines while controlling them from your local TUI:
+
+1. **Configure SSH host** in `~/.grove/config.toml`:
+   ```toml
+   [[ssh.hosts]]
+   name = "gpu-workstation"
+   host = "192.168.1.100"
+   user = "developer"
+   worktree_base = "/home/developer/grove-worktrees"
+   ```
+
+2. **Set default host** for a project in `.grove/project.toml`:
+   ```toml
+   [remote]
+   default_host = "gpu-workstation"
+   ```
+
+3. **Create remote agent**: Press `Shift+n` to create an agent on the remote host
+
+4. **Remote agents display**: Shows `@hostname` prefix in the agent list
+
+5. **Attach**: Uses `tmux -CC` over SSH for full tmux integration
+
+**Requirements:**
+- SSH key authentication (use `ssh-agent` or configure `identity_file`)
+- tmux installed on the remote host
+- Git repository accessible on remote machine
 
 ### Attaching to an Agent
 
@@ -330,6 +382,7 @@ grove/
 │   ├── gitlab/          # GitLab API client
 │   ├── github/          # GitHub API client
 │   ├── codeberg/        # Codeberg API client
+│   ├── ssh/             # SSH client, remote tmux management
 │   ├── storage/         # Session persistence
 │   ├── tmux/            # tmux session management
 │   └── ui/              # TUI components
@@ -343,6 +396,7 @@ Grove is built with:
 - [ratatui](https://github.com/ratatui-org/ratatui) - TUI framework
 - [git2](https://github.com/rust-lang/git2-rs) - Git operations
 - [tokio](https://github.com/tokio-rs/tokio) - Async runtime
+- [ssh2](https://github.com/alexcrichton/ssh2-rs) - SSH client
 - [tmux](https://github.com/tmux/tmux) - Terminal multiplexing
 
 Thanks to Anthropic, OpenAI, and Google for their AI coding assistants.

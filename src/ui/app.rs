@@ -262,6 +262,22 @@ impl<'a> AppWidget<'a> {
             InputMode::NewAgent => {
                 render_input_modal(frame, "New Agent", "Enter name:", &self.state.input_buffer);
             }
+            InputMode::NewRemoteAgent => {
+                render_input_modal(
+                    frame,
+                    "New Remote Agent",
+                    "Enter name:",
+                    &self.state.input_buffer,
+                );
+            }
+            InputMode::SelectRemoteHost => {
+                render_input_modal(
+                    frame,
+                    "Select Remote Host",
+                    "Enter host name:",
+                    &self.state.input_buffer,
+                );
+            }
             InputMode::SetNote => {
                 render_input_modal(
                     frame,

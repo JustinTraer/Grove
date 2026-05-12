@@ -10,6 +10,7 @@ pub mod devserver;
 pub mod gemini;
 pub mod git;
 pub mod opencode;
+pub mod ssh;
 pub mod storage;
 pub mod tmux;
 pub mod ui;

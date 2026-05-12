@@ -17,6 +17,12 @@ pub enum Action {
         branch: String,
         task: Option<TaskListItem>,
     },
+    CreateRemoteAgent {
+        name: String,
+        branch: String,
+        host_name: String,
+        task: Option<TaskListItem>,
+    },
     DeleteAgent {
         id: Uuid,
     },
@@ -455,6 +461,7 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     NewAgent,
+    NewRemoteAgent,
     SetNote,
     ConfirmDelete,
     ConfirmMerge,
@@ -465,4 +472,5 @@ pub enum InputMode {
     ConfirmDeleteAsana,
     BrowseTasks,
     SelectTaskStatus,
+    SelectRemoteHost,
 }

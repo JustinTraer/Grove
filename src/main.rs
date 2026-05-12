@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,9 +45,25 @@ use grove::core::projects::notion::{parse_notion_page_id, NotionTaskStatus, Opti
 use grove::core::projects::{fetch_status_options, ProjectClients};
 use grove::devserver::DevServerManager;
 use grove::git::{GitSync, Worktree};
+use grove::ssh::{RemoteTmuxSession, SshClient};
 use grove::storage::{save_session, SessionStorage};
 use grove::tmux::is_tmux_available;
 use grove::ui::{AppWidget, DevServerRenderInfo};
+
+#[derive(Debug, Clone)]
+struct AgentPollInfo {
+    session_name: String,
+    remote_host: Option<String>,
+}
+
+impl AgentPollInfo {
+    fn from_agent(agent: &Agent) -> Self {
+        Self {
+            session_name: agent.tmux_session.clone(),
+            remote_host: agent.remote_host.clone(),
+        }
+    }
+}
 
 fn matches_keybind(key: crossterm::event::KeyEvent, keybind: &grove::app::config::Keybind) -> bool {
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -408,7 +424,11 @@ async fn main() -> Result<()> {
     )));
 
     // Create watch channel for agent list updates (polling task needs current agents)
-    let initial_agents: HashSet<Uuid> = state.agents.keys().cloned().collect();
+    let initial_agents: HashMap<Uuid, AgentPollInfo> = state
+        .agents
+        .values()
+        .map(|a| (a.id, AgentPollInfo::from_agent(a)))
+        .collect();
     let (agent_watch_tx, agent_watch_rx) = watch::channel(initial_agents);
 
     // Create watch channel for agent branches (GitLab polling needs branch names)
@@ -1384,6 +1404,11 @@ fn handle_key_event(key: crossterm::event::KeyEvent, state: &AppState) -> Option
         return Some(Action::EnterInputMode(InputMode::NewAgent));
     }
 
+    // New remote agent
+    if matches_keybind(key, &kb.new_remote_agent) {
+        return Some(Action::EnterInputMode(InputMode::NewRemoteAgent));
+    }
+
     // Delete agent
     if matches_keybind(key, &kb.delete_agent) {
         let has_task = state
@@ -2126,7 +2151,7 @@ async fn process_action(
     linear_client: &Arc<OptionalLinearClient>,
     _storage: &SessionStorage,
     action_tx: &mpsc::UnboundedSender<Action>,
-    agent_watch_tx: &watch::Sender<HashSet<Uuid>>,
+    agent_watch_tx: &watch::Sender<HashMap<Uuid, AgentPollInfo>>,
     branch_watch_tx: &watch::Sender<Vec<(Uuid, String)>>,
     selected_watch_tx: &watch::Sender<Option<Uuid>>,
     asana_watch_tx: &watch::Sender<Vec<(Uuid, String)>>,
@@ -2254,7 +2279,13 @@ async fn process_action(
                     state.select_last();
                     state.toast = None;
                     // Notify polling tasks of new agent
-                    let _ = agent_watch_tx.send(state.agents.keys().cloned().collect());
+                    let _ = agent_watch_tx.send(
+                        state
+                            .agents
+                            .values()
+                            .map(|a| (a.id, AgentPollInfo::from_agent(a)))
+                            .collect(),
+                    );
                     let _ = branch_watch_tx.send(
                         state
                             .agents
@@ -2282,6 +2313,133 @@ async fn process_action(
             }
         }
 
+        Action::CreateRemoteAgent {
+            name,
+            branch,
+            host_name,
+            task,
+        } => {
+            state.log_info(format!(
+                "Creating remote agent '{}' on branch '{}' with host '{}'",
+                name, branch, host_name
+            ));
+
+            let host_config = state.config.global.ssh.get_host(&host_name);
+            if host_config.is_none() {
+                state.log_error(format!("Unknown SSH host: {}", host_name));
+                state.toast = Some(Toast::new(
+                    format!("Unknown SSH host: {}", host_name),
+                    ToastLevel::Error,
+                ));
+                return Ok(false);
+            }
+
+            let host_config = host_config.unwrap().clone();
+            let ai_agent = state.config.global.ai_agent.clone();
+
+            match agent_manager.create_remote_agent(&name, &branch, &ai_agent, &host_config) {
+                Ok(mut agent) => {
+                    state.log_info(format!(
+                        "Remote agent '{}' created successfully",
+                        agent.name
+                    ));
+
+                    if let Some(ref task_item) = task {
+                        let pm_status = match state.settings.repo_config.project_mgmt.provider {
+                            ProjectMgmtProvider::Asana => {
+                                ProjectMgmtTaskStatus::Asana(AsanaTaskStatus::NotStarted {
+                                    gid: task_item.id.clone(),
+                                    name: task_item.name.clone(),
+                                    url: task_item.url.clone(),
+                                    is_subtask: task_item.is_subtask(),
+                                    status_name: task_item.status_name.clone(),
+                                })
+                            }
+                            ProjectMgmtProvider::Notion => {
+                                ProjectMgmtTaskStatus::Notion(NotionTaskStatus::Linked {
+                                    page_id: task_item.id.clone(),
+                                    name: task_item.name.clone(),
+                                    url: task_item.url.clone(),
+                                    status_option_id: String::new(),
+                                    status_name: task_item.status_name.clone(),
+                                })
+                            }
+                            ProjectMgmtProvider::Clickup => {
+                                ProjectMgmtTaskStatus::ClickUp(ClickUpTaskStatus::NotStarted {
+                                    id: task_item.id.clone(),
+                                    name: task_item.name.clone(),
+                                    url: task_item.url.clone(),
+                                    status: task_item.status_name.clone(),
+                                    is_subtask: task_item.is_subtask(),
+                                })
+                            }
+                            ProjectMgmtProvider::Airtable => {
+                                ProjectMgmtTaskStatus::Airtable(AirtableTaskStatus::NotStarted {
+                                    id: task_item.id.clone(),
+                                    name: task_item.name.clone(),
+                                    url: task_item.url.clone(),
+                                    is_subtask: task_item.is_subtask(),
+                                })
+                            }
+                            ProjectMgmtProvider::Linear => {
+                                let identifier = task_item
+                                    .name
+                                    .split_whitespace()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string();
+                                ProjectMgmtTaskStatus::Linear(LinearTaskStatus::NotStarted {
+                                    id: task_item.id.clone(),
+                                    identifier,
+                                    name: task_item.name.clone(),
+                                    status_name: task_item.status_name.clone(),
+                                    url: task_item.url.clone(),
+                                    is_subtask: task_item.is_subtask(),
+                                })
+                            }
+                        };
+                        agent.pm_task_status = pm_status;
+                        state.log_info(format!("Linked task '{}' to agent", task_item.name));
+                    }
+
+                    let agent_id = agent.id;
+                    let has_task = task.is_some();
+                    state.add_agent(agent);
+                    state.select_last();
+                    state.toast = None;
+                    let _ = agent_watch_tx.send(
+                        state
+                            .agents
+                            .values()
+                            .map(|a| (a.id, AgentPollInfo::from_agent(a)))
+                            .collect(),
+                    );
+                    let _ = branch_watch_tx.send(
+                        state
+                            .agents
+                            .values()
+                            .map(|a| (a.id, a.branch.clone()))
+                            .collect(),
+                    );
+                    let _ = selected_watch_tx.send(state.selected_agent_id());
+
+                    if has_task {
+                        let _ = action_tx.send(Action::ExecuteAutomation {
+                            agent_id,
+                            action_type: grove::app::config::AutomationActionType::TaskAssign,
+                        });
+                    }
+                }
+                Err(e) => {
+                    state.log_error(format!("Failed to create remote agent: {}", e));
+                    state.toast = Some(Toast::new(
+                        format!("Failed to create remote agent: {}", e),
+                        ToastLevel::Error,
+                    ));
+                }
+            }
+        }
+
         Action::DeleteAgent { id } => {
             // Clear input mode if triggered directly from ConfirmDeleteAsana (n key)
             if state.is_input_mode() {
@@ -2292,46 +2450,64 @@ async fn process_action(
                     a.name.clone(),
                     a.tmux_session.clone(),
                     a.worktree_path.clone(),
+                    a.remote_host.clone(),
+                    a.remote_worktree_path.clone(),
                 )
             });
 
-            if let Some((name, tmux_session, worktree_path)) = agent_info {
+            if let Some((name, tmux_session, worktree_path, remote_host, _remote_worktree_path)) =
+                agent_info
+            {
                 state.log_info(format!("Deleting agent '{}'...", name));
                 state.loading_message = Some(format!("Deleting '{}'...", name));
 
                 let tx = action_tx.clone();
                 let name_clone = name.clone();
                 let repo_path = state.repo_path.clone();
-                tokio::spawn(async move {
-                    // Kill tmux session
-                    let session = grove::tmux::TmuxSession::new(&tmux_session);
-                    if session.exists() {
-                        let _ = session.kill();
-                    }
 
-                    // Remove worktree
-                    if std::path::Path::new(&worktree_path).exists() {
-                        let _ = std::process::Command::new("git")
-                            .args([
-                                "-C",
-                                &repo_path,
-                                "worktree",
-                                "remove",
-                                "--force",
-                                &worktree_path,
-                            ])
-                            .output();
-                        let _ = std::process::Command::new("git")
-                            .args(["-C", &repo_path, "worktree", "prune"])
-                            .output();
-                    }
-
-                    let _ = tx.send(Action::DeleteAgentComplete {
-                        id,
-                        success: true,
-                        message: format!("Deleted '{}'", name_clone),
+                if remote_host.is_some() {
+                    // Remote agent deletion
+                    tokio::spawn(async move {
+                        // Remote deletion is handled via agent_manager in the completion
+                        let _ = tx.send(Action::DeleteAgentComplete {
+                            id,
+                            success: true,
+                            message: format!("Deleted '{}'", name_clone),
+                        });
                     });
-                });
+                } else {
+                    // Local agent deletion
+                    tokio::spawn(async move {
+                        // Kill tmux session
+                        let session = grove::tmux::TmuxSession::new(&tmux_session);
+                        if session.exists() {
+                            let _ = session.kill();
+                        }
+
+                        // Remove worktree
+                        if std::path::Path::new(&worktree_path).exists() {
+                            let _ = std::process::Command::new("git")
+                                .args([
+                                    "-C",
+                                    &repo_path,
+                                    "worktree",
+                                    "remove",
+                                    "--force",
+                                    &worktree_path,
+                                ])
+                                .output();
+                            let _ = std::process::Command::new("git")
+                                .args(["-C", &repo_path, "worktree", "prune"])
+                                .output();
+                        }
+
+                        let _ = tx.send(Action::DeleteAgentComplete {
+                            id,
+                            success: true,
+                            message: format!("Deleted '{}'", name_clone),
+                        });
+                    });
+                }
             }
         }
 
@@ -5677,7 +5853,13 @@ async fn process_action(
                         state.toast = None;
                         state.exit_input_mode();
 
-                        let _ = agent_watch_tx.send(state.agents.keys().cloned().collect());
+                        let _ = agent_watch_tx.send(
+                            state
+                                .agents
+                                .values()
+                                .map(|a| (a.id, AgentPollInfo::from_agent(a)))
+                                .collect(),
+                        );
                         let _ = branch_watch_tx.send(
                             state
                                 .agents
@@ -6045,6 +6227,51 @@ async fn process_action(
                                 action_tx.send(Action::CreateAgent {
                                     name: input.trim().to_string(),
                                     branch,
+                                    task: None,
+                                })?;
+                            }
+                        }
+                    }
+                    InputMode::NewRemoteAgent => {
+                        if !input.is_empty() {
+                            let branch = grove::core::common::sanitize_branch_name(&input);
+                            if branch.is_empty() {
+                                action_tx.send(Action::ShowError(
+                                    "Invalid name: name cannot be only spaces".to_string(),
+                                ))?;
+                            } else {
+                                // Check if there's a default remote host configured
+                                let default_host =
+                                    state.settings.repo_config.remote.default_host.clone();
+                                if let Some(host_name) = default_host {
+                                    action_tx.send(Action::CreateRemoteAgent {
+                                        name: input.trim().to_string(),
+                                        branch,
+                                        host_name,
+                                        task: None,
+                                    })?;
+                                } else {
+                                    // Prompt for host selection
+                                    state.input_buffer = String::new();
+                                    state.input_mode = Some(InputMode::SelectRemoteHost);
+                                    // Store the name and branch for later
+                                    state.pending_remote_agent_name =
+                                        Some(input.trim().to_string());
+                                    state.pending_remote_agent_branch = Some(branch);
+                                }
+                            }
+                        }
+                    }
+                    InputMode::SelectRemoteHost => {
+                        if !input.is_empty() {
+                            let host_name = input.trim().to_string();
+                            let name = state.pending_remote_agent_name.take();
+                            let branch = state.pending_remote_agent_branch.take();
+                            if let (Some(name), Some(branch)) = (name, branch) {
+                                action_tx.send(Action::CreateRemoteAgent {
+                                    name,
+                                    branch,
+                                    host_name,
                                     task: None,
                                 })?;
                             }
@@ -6501,7 +6728,13 @@ async fn process_action(
             if success {
                 state.remove_agent(id);
                 state.log_info(&message);
-                let _ = agent_watch_tx.send(state.agents.keys().cloned().collect());
+                let _ = agent_watch_tx.send(
+                    state
+                        .agents
+                        .values()
+                        .map(|a| (a.id, AgentPollInfo::from_agent(a)))
+                        .collect(),
+                );
                 let _ = branch_watch_tx.send(
                     state
                         .agents
@@ -10803,14 +11036,12 @@ async fn process_action(
 
 /// Background task to poll agent status from tmux sessions.
 async fn poll_agents(
-    mut agent_rx: watch::Receiver<HashSet<Uuid>>,
+    mut agent_rx: watch::Receiver<HashMap<Uuid, AgentPollInfo>>,
     mut selected_rx: watch::Receiver<Option<Uuid>>,
     tx: mpsc::UnboundedSender<Action>,
     ai_agent: grove::app::config::AiAgent,
     debug_mode: bool,
 ) {
-    use std::collections::HashMap;
-
     // Track previous content hash for activity detection
     let mut previous_content: HashMap<Uuid, u64> = HashMap::new();
     // Track which agents already have MR URLs detected (skip deep scans for them)
@@ -10819,6 +11050,55 @@ async fn poll_agents(
     let mut deep_scan_counter: u32 = 0;
     // Track previous selected_id to log changes
     let mut prev_selected_id: Option<Uuid> = None;
+    // Cache SSH configs
+    let mut ssh_config_cache: HashMap<String, grove::app::config::RemoteHost> = HashMap::new();
+
+    fn load_ssh_config() -> Option<grove::app::config::Config> {
+        grove::app::config::Config::load().ok()
+    }
+
+    fn capture_local_pane(session_name: &str, lines: i32, ansi: bool) -> Option<String> {
+        let lines_str = format!("{}", lines);
+        let mut args = vec![
+            "capture-pane",
+            "-t",
+            session_name,
+            "-p",
+            "-J",
+            "-S",
+            lines_str.as_str(),
+        ];
+        if ansi {
+            args.push("-e");
+        }
+        let output = std::process::Command::new("tmux")
+            .args(&args)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn capture_remote_pane(
+        host: &str,
+        session_name: &str,
+        lines: usize,
+        _ansi: bool,
+        ssh_config_cache: &mut HashMap<String, grove::app::config::RemoteHost>,
+    ) -> Option<String> {
+        let config = load_ssh_config()?;
+        let host_config = config.global.ssh.get_host(host)?;
+        ssh_config_cache.insert(host.to_string(), host_config.clone());
+
+        let ssh_client = SshClient::from_config(host_config).ok()?;
+        let remote_session = RemoteTmuxSession::new(&ssh_client, session_name);
+
+        let output = remote_session.capture_pane(lines).ok()?;
+        Some(output)
+    }
 
     loop {
         deep_scan_counter += 1;
@@ -10827,7 +11107,7 @@ async fn poll_agents(
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // Get current agent list and selected agent
-        let agent_ids = agent_rx.borrow_and_update().clone();
+        let agents = agent_rx.borrow_and_update().clone();
         let selected_id = *selected_rx.borrow_and_update();
 
         // Log when selected_id changes
@@ -10836,39 +11116,35 @@ async fn poll_agents(
             prev_selected_id = selected_id;
         }
 
-        for id in agent_ids {
+        for (id, agent_info) in agents {
             let is_selected = selected_id == Some(id);
-            let session_name = format!("grove-{}", id.as_simple());
 
             // PRIORITY 1: Capture preview for selected agent FIRST
             // This ensures preview updates even if status detection crashes
             if is_selected {
-                match std::process::Command::new("tmux")
-                    .args([
-                        "capture-pane",
-                        "-t",
-                        &session_name,
-                        "-p",
-                        "-e",
-                        "-J",
-                        "-S",
-                        "-1000",
-                    ])
-                    .output()
-                {
-                    Ok(output) => {
-                        if output.status.success() {
-                            let preview = String::from_utf8_lossy(&output.stdout).to_string();
-                            if let Err(e) = tx.send(Action::UpdatePreviewContent(Some(preview))) {
-                                tracing::error!(
-                                    "poll_agents: FAILED to send UpdatePreviewContent: {}",
-                                    e
-                                );
-                            }
+                let preview_result = if let Some(ref remote_host) = agent_info.remote_host {
+                    capture_remote_pane(
+                        remote_host,
+                        &agent_info.session_name,
+                        1000,
+                        true,
+                        &mut ssh_config_cache,
+                    )
+                } else {
+                    capture_local_pane(&agent_info.session_name, -1000, true)
+                };
+
+                match preview_result {
+                    Some(preview) => {
+                        if let Err(e) = tx.send(Action::UpdatePreviewContent(Some(preview))) {
+                            tracing::error!(
+                                "poll_agents: FAILED to send UpdatePreviewContent: {}",
+                                e
+                            );
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("poll_agents: tmux preview command FAILED: {}", e);
+                    None => {
+                        tracing::debug!("poll_agents: failed to capture preview for agent {}", id);
                     }
                 }
             }
@@ -10876,119 +11152,127 @@ async fn poll_agents(
             // PRIORITY 2: Status detection (can be slow, may crash)
             // Always do a plain capture (no ANSI, consistent line count) for status detection
             // -J joins wrapped lines so URLs and long text aren't split across lines
-            let capture_result = std::process::Command::new("tmux")
-                .args([
-                    "capture-pane",
-                    "-t",
-                    &session_name,
-                    "-p",
-                    "-J",
-                    "-S",
-                    "-100",
-                ])
-                .output();
+            let content = if let Some(ref remote_host) = agent_info.remote_host {
+                capture_remote_pane(
+                    remote_host,
+                    &agent_info.session_name,
+                    100,
+                    false,
+                    &mut ssh_config_cache,
+                )
+            } else {
+                capture_local_pane(&agent_info.session_name, -100, false)
+            };
 
-            if let Ok(output) = capture_result {
-                if output.status.success() {
-                    let content = String::from_utf8_lossy(&output.stdout).to_string();
+            if let Some(content) = content {
+                // Track activity by comparing content hash
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                let content_hash = hasher.finish();
 
-                    // Track activity by comparing content hash
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    content.hash(&mut hasher);
-                    let content_hash = hasher.finish();
+                let had_activity = previous_content
+                    .get(&id)
+                    .map(|&prev| prev != content_hash)
+                    .unwrap_or(false);
 
-                    let had_activity = previous_content
-                        .get(&id)
-                        .map(|&prev| prev != content_hash)
-                        .unwrap_or(false);
+                previous_content.insert(id, content_hash);
+                let _ = tx.send(Action::RecordActivity { id, had_activity });
 
-                    previous_content.insert(id, content_hash);
-                    let _ = tx.send(Action::RecordActivity { id, had_activity });
-
-                    // Query foreground process for ground-truth status detection
-                    let foreground = {
-                        let cmd_output = std::process::Command::new("tmux")
-                            .args([
-                                "display-message",
-                                "-t",
-                                &session_name,
-                                "-p",
-                                "#{pane_current_command}",
-                            ])
-                            .output();
-                        match cmd_output {
-                            Ok(o) if o.status.success() => {
-                                let cmd = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // Query foreground process for ground-truth status detection
+                let foreground = if let Some(ref remote_host) = agent_info.remote_host {
+                    if let Some(host_config) = ssh_config_cache.get(remote_host) {
+                        if let Ok(ssh_client) = SshClient::from_config(host_config) {
+                            let remote_session =
+                                RemoteTmuxSession::new(&ssh_client, &agent_info.session_name);
+                            remote_session.pane_current_command().map(|cmd| {
                                 ForegroundProcess::from_command_for_agent(&cmd, ai_agent.clone())
-                            }
-                            _ => ForegroundProcess::Unknown,
+                            })
+                        } else {
+                            None
                         }
-                    };
-                    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        detect_status_for_agent(&content, foreground, ai_agent.clone())
-                    }))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("detect_status_for_agent panicked: {:?}", e);
-                        StatusDetection::new(AgentStatus::Idle)
-                    });
-
-                    let status_reason = if debug_mode {
-                        status.to_status_reason()
                     } else {
                         None
+                    }
+                } else {
+                    let cmd_output = std::process::Command::new("tmux")
+                        .args([
+                            "display-message",
+                            "-t",
+                            &agent_info.session_name,
+                            "-p",
+                            "#{pane_current_command}",
+                        ])
+                        .output();
+                    match cmd_output {
+                        Ok(o) if o.status.success() => {
+                            let cmd = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                            Some(ForegroundProcess::from_command_for_agent(
+                                &cmd,
+                                ai_agent.clone(),
+                            ))
+                        }
+                        _ => None,
+                    }
+                }
+                .unwrap_or(ForegroundProcess::Unknown);
+
+                let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    detect_status_for_agent(&content, foreground, ai_agent.clone())
+                }))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("detect_status_for_agent panicked: {:?}", e);
+                    StatusDetection::new(AgentStatus::Idle)
+                });
+
+                let status_reason = if debug_mode {
+                    status.to_status_reason()
+                } else {
+                    None
+                };
+
+                let _ = tx.send(Action::UpdateAgentStatus {
+                    id,
+                    status: status.status,
+                    status_reason,
+                });
+
+                // Check for MR URLs detection
+                if !agents_with_mr.contains(&id) {
+                    if let Some(mr_status) = detect_mr_url(&content) {
+                        agents_with_mr.insert(id);
+                        let _ = tx.send(Action::UpdateMrStatus {
+                            id,
+                            status: mr_status,
+                        });
+                    }
+                }
+
+                // Check for checklist progress (wrap in catch_unwind to prevent crashing the loop)
+                let progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    detect_checklist_progress(&content, ai_agent.clone())
+                }))
+                .unwrap_or_else(|e| {
+                    tracing::warn!("detect_checklist_progress panicked, skipping: {:?}", e);
+                    None
+                });
+                let _ = tx.send(Action::UpdateChecklistProgress { id, progress });
+
+                // Deep MR URL scan: capture 500 lines every ~5s for agents without MR detected
+                if deep_scan_counter.is_multiple_of(20) && !agents_with_mr.contains(&id) {
+                    let deep_content = if let Some(ref remote_host) = agent_info.remote_host {
+                        capture_remote_pane(
+                            remote_host,
+                            &agent_info.session_name,
+                            500,
+                            false,
+                            &mut ssh_config_cache,
+                        )
+                    } else {
+                        capture_local_pane(&agent_info.session_name, -500, false)
                     };
 
-                    let _ = tx.send(Action::UpdateAgentStatus {
-                        id,
-                        status: status.status,
-                        status_reason,
-                    });
-
-                    // Check for MR URLs detection
-                    if !agents_with_mr.contains(&id) {
-                        if let Some(mr_status) = detect_mr_url(&content) {
-                            agents_with_mr.insert(id);
-                            let _ = tx.send(Action::UpdateMrStatus {
-                                id,
-                                status: mr_status,
-                            });
-                        }
-                    }
-
-                    // Check for checklist progress (wrap in catch_unwind to prevent crashing the loop)
-                    let progress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        detect_checklist_progress(&content, ai_agent.clone())
-                    }))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("detect_checklist_progress panicked, skipping: {:?}", e);
-                        None
-                    });
-                    let _ = tx.send(Action::UpdateChecklistProgress { id, progress });
-                }
-            } else {
-                tracing::warn!(
-                    "poll_agents: capture-pane command FAILED for session {}",
-                    session_name
-                );
-            }
-
-            // Deep MR URL scan: capture 500 lines every ~5s for agents without MR detected
-            if deep_scan_counter.is_multiple_of(20) && !agents_with_mr.contains(&id) {
-                if let Ok(output) = std::process::Command::new("tmux")
-                    .args([
-                        "capture-pane",
-                        "-t",
-                        &session_name,
-                        "-p",
-                        "-J",
-                        "-S",
-                        "-500",
-                    ])
-                    .output()
-                {
-                    if output.status.success() {
-                        let deep_content = String::from_utf8_lossy(&output.stdout).to_string();
+                    if let Some(deep_content) = deep_content {
                         if let Some(mr_status) = detect_mr_url(&deep_content) {
                             agents_with_mr.insert(id);
                             let _ = tx.send(Action::UpdateMrStatus {
@@ -10998,6 +11282,11 @@ async fn poll_agents(
                         }
                     }
                 }
+            } else {
+                tracing::debug!(
+                    "poll_agents: capture-pane returned empty for session {}",
+                    agent_info.session_name
+                );
             }
         }
 

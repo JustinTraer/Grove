@@ -297,6 +297,10 @@ pub struct Agent {
     pub pending_status_count: u32,
     #[serde(default)]
     pub pause_context: Option<PauseContext>,
+    #[serde(default)]
+    pub remote_host: Option<String>,
+    #[serde(default)]
+    pub remote_worktree_path: Option<String>,
 }
 
 impl Agent {
@@ -332,6 +336,8 @@ impl Agent {
             pending_status: None,
             pending_status_count: 0,
             pause_context: None,
+            remote_host: None,
+            remote_worktree_path: None,
         }
     }
 
@@ -398,5 +404,13 @@ impl Agent {
 
     pub fn set_status(&mut self, status: AgentStatus) {
         self.status = status;
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.remote_host.is_some()
+    }
+
+    pub fn is_local(&self) -> bool {
+        !self.is_remote()
     }
 }
